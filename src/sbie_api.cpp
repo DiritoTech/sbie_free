@@ -34,19 +34,29 @@ bool SbieApi::open()
     if (h_ != INVALID_HANDLE_VALUE)
         return true;
 
-    // Qt 侧用 FILE_GENERIC_READ 打开；这里先按同样权限尝试，失败再要读写
-    h_ = CreateFileW(L"\\\\.\\SandboxieDriverApi",
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, OPEN_EXISTING, 0, nullptr);
+    // core/drv/api.c 里 Api_Init 只调了 IoCreateDevice，没有 IoCreateSymbolicLink，
+    // 所以 DOS 命名空间里没有这个名字；必须用 GLOBALROOT 直接走设备对象路径。
+    // 官方 Qt 前端是 NtOpenFile("\Device\SandboxieDriverApi")，效果等价。
+    static const wchar_t* kPaths[] = {
+        L"\\\\?\\GLOBALROOT\\Device\\SandboxieDriverApi",
+        L"\\\\.\\SandboxieDriverApi",                 // 万一将来加了符号链接
+    };
 
-    if (h_ == INVALID_HANDLE_VALUE)
-        h_ = CreateFileW(L"\\\\.\\SandboxieDriverApi",
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr, OPEN_EXISTING, 0, nullptr);
+    for (auto path : kPaths) {
+        h_ = CreateFileW(path, GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h_ != INVALID_HANDLE_VALUE)
+            return true;
 
-    return h_ != INVALID_HANDLE_VALUE;
+        h_ = CreateFileW(path, GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h_ != INVALID_HANDLE_VALUE)
+            return true;
+
+        lastError_ = GetLastError();
+    }
+
+    return false;
 }
 
 bool SbieApi::query_cert_state(uint64_t& state)
@@ -66,8 +76,10 @@ bool SbieApi::query_cert_state(uint64_t& state)
     DWORD ret = 0;
     // METHOD_NEITHER：输入缓冲就是 parms 本身，驱动自己探测 info_data 指针；
     // 这种方法的 IOCTL 不允许传输出缓冲。
-    if (!DeviceIoControl(h_, kSbieDrvCtlCode, parms, sizeof(parms), nullptr, 0, &ret, nullptr))
+    if (!DeviceIoControl(h_, kSbieDrvCtlCode, parms, sizeof(parms), nullptr, 0, &ret, nullptr)) {
+        lastError_ = GetLastError();
         return false;
+    }
 
     return true;
 }

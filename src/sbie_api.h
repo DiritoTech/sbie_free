@@ -17,14 +17,20 @@ class SbieApi {
 public:
     ~SbieApi();
 
-    // 打开 \\\\.\\SandboxieDriverApi（需要 SbieSvc 已启动）
+    // 打开驱动设备。
+    // 注意：驱动只创建了设备对象 \Device\SandboxieDriverApi，没有 DOS 符号链接，
+    // 因此 \\.\SandboxieDriverApi 会失败（GLE=2），必须走 GLOBALROOT / NT 路径。
     bool open();
 
     // 读取 SCertInfo.State（info_class = -1）
     bool query_cert_state(uint64_t& state);
 
+    // 最近一次失败的错误码（open 失败时用来说明原因）
+    DWORD last_error() const { return lastError_; }
+
 private:
     HANDLE h_ = INVALID_HANDLE_VALUE;
+    DWORD  lastError_ = 0;
 };
 
 } // namespace sbu

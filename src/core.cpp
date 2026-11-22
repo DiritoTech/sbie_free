@@ -702,25 +702,39 @@ static std::vector<uint64_t> FindZeroStoreTargets(const std::vector<BYTE>& code,
 {
     std::vector<uint64_t> out;
 
+    auto pushIfInData = [&](uint64_t t) {
+        if (t >= dataLo && t < dataHi) out.push_back(t);
+    };
+
     for (size_t i = 0; i + 11 <= code.size(); i++) {
         // 48 C7 05 disp32 imm32  ->  mov qword ptr [rip+disp32], imm32
         if (code[i] == 0x48 && code[i + 1] == 0xC7 && code[i + 2] == 0x05) {
             int32_t disp; uint32_t imm;
             memcpy(&disp, &code[i + 3], 4);
             memcpy(&imm, &code[i + 7], 4);
-            if (imm == 0) {
-                uint64_t t = codeVa + i + 11 + (int64_t)disp;
-                if (t >= dataLo && t < dataHi) out.push_back(t);
-            }
+            if (imm == 0)
+                pushIfInData(codeVa + i + 11 + (int64_t)disp);
         }
         // C7 05 disp32 imm32      ->  mov dword ptr [rip+disp32], imm32
         if (i + 10 <= code.size() && code[i] == 0xC7 && code[i + 1] == 0x05) {
             int32_t disp; uint32_t imm;
             memcpy(&disp, &code[i + 2], 4);
             memcpy(&imm, &code[i + 6], 4);
-            if (imm == 0) {
-                uint64_t t = codeVa + i + 10 + (int64_t)disp;
-                if (t >= dataLo && t < dataHi) out.push_back(t);
+            if (imm == 0)
+                pushIfInData(codeVa + i + 10 + (int64_t)disp);
+        }
+        // 48 89 05 disp32         ->  mov [rip+disp32], rax  （前置通常是 xor eax,eax）
+        if (i + 7 <= code.size() && code[i] == 0x48 && code[i + 1] == 0x89 && code[i + 2] == 0x05) {
+            bool zeroSource = false;
+            for (size_t back = 3; back <= 6 && back <= i + 1; back++) {
+                const BYTE* p = &code[i - (back - 1)];
+                if (p[0] == 0x33 && p[1] == 0xC0) { zeroSource = true; break; }   // xor eax,eax
+                if (p[0] == 0x45 && p[1] == 0x31 && p[2] == 0xC0) { zeroSource = true; break; } // xor r8d,r8d
+            }
+            if (zeroSource) {
+                int32_t disp;
+                memcpy(&disp, &code[i + 3], 4);
+                pushIfInData(codeVa + i + 7 + (int64_t)disp);
             }
         }
     }
@@ -734,13 +748,16 @@ static bool PatchCertInfoFallback(rtcore::RTCore& drv, const std::vector<Section
 {
     SbieApi api;
     if (!api.open()) {
-        Log("[-]     打不开 \\\\.\\SandboxieDriverApi（SbieSvc 没在运行？），兜底不可用");
+        Log("[-]     打不开驱动设备 \\Device\\SandboxieDriverApi (GLE=%lu)，兜底不可用",
+            (unsigned long)api.last_error());
+        Log("         该设备由 SbieDrv 在 DriverEntry 创建；请确认 Sandboxie 已安装且 SbieDrv 正在运行");
         return false;
     }
 
     uint64_t before = 0;
     if (!api.query_cert_state(before)) {
-        Log("[-]     驱动 API 查询证书状态失败，兜底不可用");
+        Log("[-]     驱动 API 查询证书状态失败 (GLE=%lu)，兜底不可用",
+            (unsigned long)api.last_error());
         return false;
     }
     Log("[.]     当前驱动证书状态: 0x%llX", (unsigned long long)before);
@@ -769,31 +786,45 @@ static bool PatchCertInfoFallback(rtcore::RTCore& drv, const std::vector<Section
         return false;
 
     for (uint64_t addr : cands) {
-        BYTE orig[8] = { 0 };
+        // SCertInfo 是 16 字节（State 8 + expirers 4 + 对齐 4），没有证书时全 0。
+        // 只探测“整块都是 0”的候选，避免碰到正在使用的指针之类。
+        BYTE orig[16] = { 0 };
         try { drv.read_va(addr, orig, sizeof(orig)); } catch (...) { continue; }
 
-        uint64_t origVal = 0;
-        memcpy(&origVal, orig, 8);
-        if (origVal != 0)          // 没有证书时这里应当是 0
+        bool allZero = true;
+        for (BYTE b : orig) if (b) { allZero = false; break; }
+        if (!allZero)
             continue;
 
+        // 第一轮探测：写入满级状态，看 API 是否原样读回
         try { drv.write_u64(addr, kCertFullState); } catch (...) { continue; }
-
         uint64_t st = 0;
-        if (api.query_cert_state(st) && st == kCertFullState) {
-            try { uint32_t zero = 0; drv.write_u32(addr + 8, zero); } catch (...) {}
-            Log("[+]     命中 Verify_CertInfo: 0x%llX（写到 +0x8 的 expirers 也清零）",
-                (unsigned long long)addr);
-            uint64_t now = 0;
-            if (api.query_cert_state(now))
-                Log("[+]     驱动现在上报的证书状态: 0x%llX", (unsigned long long)now);
-            return true;
+        if (!api.query_cert_state(st) || st != kCertFullState) {
+            try { drv.write_va(addr, orig, sizeof(orig)); } catch (...) {}  // 不是它，恢复
+            continue;
         }
 
-        try { drv.write_va(addr, orig, sizeof(orig)); } catch (...) {}  // 不是它，恢复
+        // 第二轮确认：换成只带 active 的值，必须同样能读回（排除巧合）
+        try { drv.write_u64(addr, 1); } catch (...) {}
+        uint64_t st2 = 0;
+        if (!api.query_cert_state(st2) || st2 != 1) {
+            try { drv.write_va(addr, orig, sizeof(orig)); } catch (...) {}
+            continue;
+        }
+
+        // 确认命中：写回满级状态，并把 +0x8 的 expirers_in_sec 清零
+        try { drv.write_u64(addr, kCertFullState); } catch (...) {}
+        try { uint32_t zero = 0; drv.write_u32(addr + 8, zero); } catch (...) {}
+
+        Log("[+]     命中 Verify_CertInfo: 0x%llX（已写入满级状态）", (unsigned long long)addr);
+
+        uint64_t now = 0;
+        if (api.query_cert_state(now))
+            Log("[+]     驱动现在上报的证书状态: 0x%llX", (unsigned long long)now);
+        return true;
     }
 
-    Log("[-]     候选地址都不是 Verify_CertInfo");
+    Log("[-]     候选地址都不是 Verify_CertInfo（%zu 个候选全部不匹配）", cands.size());
     return false;
 }
 
