@@ -1,0 +1,13 @@
+build/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+Certificate.dat
+key.hex
+mypub.hex
+sbie_key_backup.bin
+*.sig.bak

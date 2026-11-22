@@ -1,0 +1,55 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # 用 vswhere 自动定位已安装的 VS（windows-latest 现在可能是 VS 17 也可能是 VS 18），
+      # 不写死生成器版本，避免 "could not find any instance of Visual Studio"
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          if (-not $ver) { $ver = "dev" }
+          $ver = $ver -replace '[^\w\.\-]', '-'
+          $out = "SandBoxieUnlocker-$ver.zip"
+          # 兼容 Ninja（build/）与 VS 生成器（build/Release/）两种输出目录
+          $exe = (Get-ChildItem -Path build -Recurse -Filter SandBoxieUnlocker.exe | Select-Object -First 1).FullName
+          $sys = (Get-ChildItem -Path build -Recurse -Filter RTCore64.sys | Select-Object -First 1).FullName
+          if (-not $exe -or -not $sys) { throw "构建产物未找到: exe=$exe sys=$sys" }
+          Compress-Archive -Path $exe,$sys -DestinationPath $out
+          "ZIPNAME=$out" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # 无论 tag 还是手动触发都产出 artifact（Release 被拦时的兜底）
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: SandBoxieUnlocker-${{ github.ref_name }}
+          path: ${{ env.ZIPNAME }}
+          if-no-files-found: error
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIPNAME }}
