@@ -18,6 +18,7 @@ endif()
 add_executable(SandBoxieUnlocker WIN32
     src/main.cpp
     src/core.cpp
+    src/sbie_api.cpp
     src/windows_security_check.cpp
 )
 

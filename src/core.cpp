@@ -32,6 +32,7 @@
 #include <stdexcept>
 
 #include "rtcore.h"
+#include "sbie_api.h"
 #include "windows_security_check.h"
 
 namespace sbu {
@@ -370,9 +371,9 @@ static bool ScanSectionForPublicKey(const rtcore::RTCore& drv, const SectionInfo
 
 // 在驱动镜像的所有段里定位公钥（1.19+ 位于只读的 .rdata）
 static bool LocatePublicKey(const rtcore::RTCore& drv, uint64_t baseVa,
+                            std::vector<SectionInfo>& secs,
                             uint64_t& keyVa, DWORD& keyChars)
 {
-    std::vector<SectionInfo> secs;
     if (!ReadSectionTable(drv, baseVa, secs, true))
         return false;
 
@@ -665,6 +666,137 @@ static void StopAndDeleteRtCore()
     CloseServiceHandle(hSCM);
 }
 
+// ---------------- 兜底：直接写 .data 中的 Verify_CertInfo ----------------
+// 1.19 起公钥被放进只读的 .rdata，正常路径必须做物理写；但有些机器的 HAL 不让
+// 映射（A 报 0x1450、B 报 0x57），这条路就彻底断了。
+//
+// 此时退而写驱动**可写**的 .data 段：SCertInfo（Verify_CertInfo）就放在那里，
+// 驱动在每次创建沙盒进程时都会读它，所以直接写成“满级永恒证书”即可解锁。
+//
+// 定位方式（不依赖硬编码地址）：
+//   KphValidateCertificate 的第一句是 Verify_CertInfo.State = 0，会编译成
+//   “mov qword ptr [rip+disp], 0”，把 .text 里所有这类指令的目标地址收出来
+//   （它们都落在 .data），再用驱动 API 逐个验证：写进去能从 API 立刻读回来的就是它。
+static const uint64_t kCertFullState =
+      (1ULL << 0)     // active
+    | (1ULL << 6)     // locked
+    | (4ULL << 8)     // type  = eCertEternal
+    | (7ULL << 13)    // level = eCertMaxLevel
+    | (0xFULL << 28); // opt_desk | opt_net | opt_enc | opt_sec
+
+static bool ReadSectionBytes(rtcore::RTCore& drv, const SectionInfo& s, std::vector<BYTE>& out)
+{
+    if (s.size == 0 || s.size > 0x400000)
+        return false;
+    out.assign((size_t)s.size, 0);
+    for (size_t i = 0; i + 4 <= out.size(); i += 4) {
+        uint32_t v;
+        try { v = drv.read_u32(s.va + i); } catch (...) { return false; }
+        memcpy(out.data() + i, &v, 4);
+    }
+    return true;
+}
+
+static std::vector<uint64_t> FindZeroStoreTargets(const std::vector<BYTE>& code, uint64_t codeVa,
+                                                  uint64_t dataLo, uint64_t dataHi)
+{
+    std::vector<uint64_t> out;
+
+    for (size_t i = 0; i + 11 <= code.size(); i++) {
+        // 48 C7 05 disp32 imm32  ->  mov qword ptr [rip+disp32], imm32
+        if (code[i] == 0x48 && code[i + 1] == 0xC7 && code[i + 2] == 0x05) {
+            int32_t disp; uint32_t imm;
+            memcpy(&disp, &code[i + 3], 4);
+            memcpy(&imm, &code[i + 7], 4);
+            if (imm == 0) {
+                uint64_t t = codeVa + i + 11 + (int64_t)disp;
+                if (t >= dataLo && t < dataHi) out.push_back(t);
+            }
+        }
+        // C7 05 disp32 imm32      ->  mov dword ptr [rip+disp32], imm32
+        if (i + 10 <= code.size() && code[i] == 0xC7 && code[i + 1] == 0x05) {
+            int32_t disp; uint32_t imm;
+            memcpy(&disp, &code[i + 2], 4);
+            memcpy(&imm, &code[i + 6], 4);
+            if (imm == 0) {
+                uint64_t t = codeVa + i + 10 + (int64_t)disp;
+                if (t >= dataLo && t < dataHi) out.push_back(t);
+            }
+        }
+    }
+
+    std::sort(out.begin(), out.end());
+    out.erase(std::unique(out.begin(), out.end()), out.end());
+    return out;
+}
+
+static bool PatchCertInfoFallback(rtcore::RTCore& drv, const std::vector<SectionInfo>& secs)
+{
+    SbieApi api;
+    if (!api.open()) {
+        Log("[-]     打不开 \\\\.\\SandboxieDriverApi（SbieSvc 没在运行？），兜底不可用");
+        return false;
+    }
+
+    uint64_t before = 0;
+    if (!api.query_cert_state(before)) {
+        Log("[-]     驱动 API 查询证书状态失败，兜底不可用");
+        return false;
+    }
+    Log("[.]     当前驱动证书状态: 0x%llX", (unsigned long long)before);
+
+    const SectionInfo* text = nullptr;
+    const SectionInfo* data = nullptr;
+    for (auto& s : secs) {
+        if (_stricmp(s.name.c_str(), ".text") == 0) text = &s;
+        if (_stricmp(s.name.c_str(), ".data") == 0) data = &s;
+    }
+    if (!text || !data) {
+        Log("[-]     段表里没有 .text/.data，兜底不可用");
+        return false;
+    }
+
+    Log("[.]     读取 .text (0x%llX 字节) 以定位 Verify_CertInfo...", (unsigned long long)text->size);
+    std::vector<BYTE> code;
+    if (!ReadSectionBytes(drv, *text, code)) {
+        Log("[-]     读取 .text 失败");
+        return false;
+    }
+
+    auto cands = FindZeroStoreTargets(code, text->va, data->va, data->va + data->size);
+    Log("[.]     找到 %zu 个候选地址，逐个用驱动 API 验证...", cands.size());
+    if (cands.empty())
+        return false;
+
+    for (uint64_t addr : cands) {
+        BYTE orig[8] = { 0 };
+        try { drv.read_va(addr, orig, sizeof(orig)); } catch (...) { continue; }
+
+        uint64_t origVal = 0;
+        memcpy(&origVal, orig, 8);
+        if (origVal != 0)          // 没有证书时这里应当是 0
+            continue;
+
+        try { drv.write_u64(addr, kCertFullState); } catch (...) { continue; }
+
+        uint64_t st = 0;
+        if (api.query_cert_state(st) && st == kCertFullState) {
+            try { uint32_t zero = 0; drv.write_u32(addr + 8, zero); } catch (...) {}
+            Log("[+]     命中 Verify_CertInfo: 0x%llX（写到 +0x8 的 expirers 也清零）",
+                (unsigned long long)addr);
+            uint64_t now = 0;
+            if (api.query_cert_state(now))
+                Log("[+]     驱动现在上报的证书状态: 0x%llX", (unsigned long long)now);
+            return true;
+        }
+
+        try { drv.write_va(addr, orig, sizeof(orig)); } catch (...) {}  // 不是它，恢复
+    }
+
+    Log("[-]     候选地址都不是 Verify_CertInfo");
+    return false;
+}
+
 // 探测可用的物理映射原语（这个驱动的两套映射在不同系统上表现不同）
 static bool ProbeMapPrimitive(rtcore::RTCore& drv)
 {
@@ -950,7 +1082,8 @@ void RunFlow(const std::string& name, const std::string& level, long long days)
 
     uint64_t keyVa = 0;
     DWORD keyChars = 0;
-    if (!LocatePublicKey(drv, baseVa, keyVa, keyChars)) {
+    std::vector<SectionInfo> secs;
+    if (!LocatePublicKey(drv, baseVa, secs, keyVa, keyChars)) {
         Log("[-] 5/9 驱动映像中未找到 ECS1 公钥特征");
         return;
     }
@@ -959,7 +1092,19 @@ void RunFlow(const std::string& name, const std::string& level, long long days)
 
     // 6) 备份 + 打补丁 + 校验
     if (!PatchPublicKey(drv, keyVa, keyChars, pub)) {
-        Log("[-] 6/9 公钥补丁失败");
+        Log("[!] 6/9 公钥补丁失败，改用 .data 兜底（直接写 Verify_CertInfo）...");
+        if (!PatchCertInfoFallback(drv, secs)) {
+            Log("[-] 6/9 兜底也失败，本次未能解锁");
+            return;
+        }
+        Log("");
+        Log("[+] 6/9 已通过驱动数据段解锁（没有改动只读段）");
+        Log("    注意以下三点：");
+        Log("    1) 这是内存补丁，重启系统后失效，重新运行本工具即可；");
+        Log("    2) 重启 SandMan / 重装证书会让驱动重新校验并把状态清零，需要重新运行本工具；");
+        Log("    3) SandMan 界面里仍显示“未认证”，新建盒子时的类型下拉可能仍受限，");
+        Log("       但驱动层已经放行：已配置 SecurityMode/PrivacyMode/ConfidentialBox 等特性的");
+        Log("       盒子可以正常工作（可直接编辑 Sandboxie.ini 或用模板设置）。");
         return;
     }
     Log("[+] 6/9 驱动公钥已替换");
@@ -1011,7 +1156,8 @@ void RunRestore()
             uint64_t baseVa = GetDriverBase("SbieDrv.sys");
             uint64_t keyVa = 0;
             DWORD keyChars = 0;
-            if (baseVa && LocatePublicKey(drv, baseVa, keyVa, keyChars)) {
+            std::vector<SectionInfo> secs;
+            if (baseVa && LocatePublicKey(drv, baseVa, secs, keyVa, keyChars)) {
                 uint64_t cr3 = 0, pa = 0;
                 bool translated = false;
                 try {
